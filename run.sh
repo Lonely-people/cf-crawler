@@ -2,8 +2,7 @@
 #
 # cf-crawler 自动化脚本
 # 1. 清除 tutorials/ 和 urls.txt 旧内容
-# 2. 从 problems.txt 查找 Editorial URL → urls.txt
-# 3. 按题目拆分 Tutorial → tutorials/
+# 2. 按题目拆分 Tutorial → tutorials/
 #
 # 用法: ./run.sh [problems_file]
 
@@ -16,17 +15,13 @@ URLS_FILE="./urls.txt"
 echo "=== cf-crawler 自动化 ==="
 
 # ---- 清理 ----
-echo "[1/3] 清理旧内容..."
+echo "[1/2] 清理旧内容..."
 rm -rf "$TUTORIALS_DIR"/*
 echo "# Codeforces Blog URLs - 每行一个 URL，以 # 开头的行会被忽略" > "$URLS_FILE"
 echo "  ✓ 已清除"
 
-# ---- 查找 Editorial URL ----
-echo "[2/3] 从 $PROBLEMS_FILE 查找 Editorial URL..."
-python find_editorial_urls.py "$PROBLEMS_FILE" -o "$URLS_FILE"
-
 # ---- 按题目拆分爬取 ----
-echo "[3/3] 按题目拆分爬取 Tutorial..."
+echo "[2/2] 按题目拆分爬取 Tutorial..."
 python cf_blog_crawler.py -P "$PROBLEMS_FILE" -o "$TUTORIALS_DIR"
 
 echo "=== 完成 ==="

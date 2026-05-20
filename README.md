@@ -53,7 +53,7 @@ https://codeforces.com/problemset/problem/2230/D
 ./run.sh my_problems.txt # 指定其他文件
 ```
 
-自动完成：清除旧内容 → 查找 Editorial URL → 按题目拆分爬取。
+自动完成：清除旧内容 → 按题目拆分爬取。
 
 ### 辅助：查找 Editorial URL
 
