@@ -10,6 +10,7 @@ Codeforces Blog Crawler
 """
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -43,10 +44,11 @@ DELAY_BETWEEN_REQUESTS = 5.0  # 请求间隔（秒），避免被封
 # ---------------------------------------------------------------------------
 # 核心逻辑
 # ---------------------------------------------------------------------------
-def fetch_page(url: str) -> Optional[str]:
+def fetch_page(url: str, session: requests.Session = None) -> Optional[str]:
     """获取页面 HTML，失败返回 None。"""
+    fetcher = session if session else requests
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        resp = fetcher.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.text
     except requests.RequestException as e:
@@ -54,8 +56,58 @@ def fetch_page(url: str) -> Optional[str]:
         return None
 
 
-def parse_blog(html: str, url: str) -> Optional[dict]:
-    """从 HTML 中解析 blog 元数据和正文，返回 dict 或 None。"""
+def fetch_tutorial_content(
+    session: requests.Session, problem_code: str, csrf_token: str = None
+) -> Optional[str]:
+    """通过 AJAX API 获取题解 Tutorial 的真实内容。
+
+    Codeforces 的 editorial 页面中，Tutorial 折叠块通过 JS 异步加载，
+    POST 到 /data/problemTutorial 获取实际内容。
+    需要携带从博客页面提取的 CSRF Token。
+    """
+    api_url = "https://codeforces.com/data/problemTutorial"
+    ajax_headers = {
+        **HEADERS,
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Origin": "https://codeforces.com",
+    }
+    if csrf_token:
+        ajax_headers["X-Csrf-Token"] = csrf_token
+    try:
+        resp = session.post(
+            api_url,
+            data={"problemCode": problem_code},
+            headers=ajax_headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        if result.get("success") == "true":
+            return result.get("html", "")
+        else:
+            print(
+                f"  [WARN] Tutorial API 返回失败: {problem_code}",
+                file=sys.stderr,
+            )
+            return None
+    except (requests.RequestException, json.JSONDecodeError) as e:
+        print(
+            f"  [WARN] 获取 Tutorial 失败 ({problem_code}): {e}",
+            file=sys.stderr,
+        )
+        return None
+
+
+def parse_blog(
+    html: str, url: str, session: requests.Session = None
+) -> Optional[dict]:
+    """从 HTML 中解析 blog 元数据和正文，返回 dict 或 None。
+
+    如果提供了 session 且页面包含 problemTutorial 占位符，
+    会通过 AJAX API 获取真实的 Tutorial 内容进行替换。
+    """
     soup = BeautifulSoup(html, "html.parser")
 
     # ---- 标题 ----
@@ -97,6 +149,32 @@ def parse_blog(html: str, url: str) -> Optional[dict]:
     if not body_div:
         print(f"[ERROR] 未找到博客正文: {url}", file=sys.stderr)
         return None
+
+    # ---- 异步加载的 Tutorial 占位符替换 ----
+    tutorial_placeholders = body_div.select("div.problemTutorial[problemcode]")
+    if tutorial_placeholders and session:
+        # 从页面提取 CSRF Token
+        csrf_meta = soup.find("meta", attrs={"name": "X-Csrf-Token"})
+        csrf_token = csrf_meta.get("content", "") if csrf_meta else ""
+
+        print(f"  检测到 {len(tutorial_placeholders)} 个 Tutorial 占位符，正在获取真实内容...")
+        for placeholder in tutorial_placeholders:
+            problem_code = placeholder.get("problemcode", "")
+            if not problem_code:
+                continue
+            real_html = fetch_tutorial_content(session, problem_code, csrf_token)
+            if real_html:
+                # 将 API 返回的 HTML 解析后替换占位符
+                real_fragment = BeautifulSoup(real_html, "html.parser")
+                placeholder.clear()
+                placeholder.append(real_fragment)
+                print(f"    ✓ Tutorial {problem_code} 获取成功")
+            else:
+                # 保留占位文本，但加上标记
+                placeholder.string = f"*Tutorial for {problem_code} is not available.*"
+                print(f"    ✗ Tutorial {problem_code} 获取失败，保留占位")
+            # 请求间隔（对 API 也适用）
+            time.sleep(0.5)
 
     # 移除 MathJax 脚本（保留 LaTeX 源码即可）
     for script in body_div.find_all("script"):
@@ -171,6 +249,10 @@ def crawl_urls(urls: list[str], output_dir: str) -> list[dict]:
     os.makedirs(output_dir, exist_ok=True)
     results = []
 
+    # 使用 Session 保持 cookie，避免 Cloudflare 拦截对 /data/problemTutorial 的请求
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
     for i, url in enumerate(urls, 1):
         url = url.strip()
         if not url or url.startswith("#"):
@@ -178,12 +260,12 @@ def crawl_urls(urls: list[str], output_dir: str) -> list[dict]:
 
         print(f"[{i}/{len(urls)}] 正在爬取: {url}")
 
-        html = fetch_page(url)
+        html = fetch_page(url, session=session)
         if not html:
             results.append({"url": url, "success": False, "error": "fetch failed"})
             continue
 
-        blog = parse_blog(html, url)
+        blog = parse_blog(html, url, session=session)
         if not blog:
             results.append({"url": url, "success": False, "error": "parse failed"})
             continue
