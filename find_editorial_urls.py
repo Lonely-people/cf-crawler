@@ -48,8 +48,8 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.5",
 }
 
-REQUEST_TIMEOUT = 30  # 秒
-DEFAULT_DELAY = 5.0   # 默认请求间隔（秒），避免被封 IP
+REQUEST_TIMEOUT = 90  # 秒
+DEFAULT_DELAY = 10.0   # 默认请求间隔（秒），避免被封 IP
 
 # 已知的 editorial 链接锚文本/标题关键词（大小写不敏感）
 EDITORIAL_KEYWORDS = [

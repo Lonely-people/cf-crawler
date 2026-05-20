@@ -44,7 +44,7 @@ HEADERS = {
 }
 
 REQUEST_TIMEOUT = 90  # 秒
-DELAY_BETWEEN_REQUESTS = 5.0  # 请求间隔（秒），避免被封
+DELAY_BETWEEN_REQUESTS = 10.0  # 请求间隔（秒），避免被封
 
 
 # ---------------------------------------------------------------------------
