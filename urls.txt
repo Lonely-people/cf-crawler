@@ -1,4 +1,1 @@
 # Codeforces Blog URLs - 每行一个 URL，以 # 开头的行会被忽略
-https://codeforces.com/blog/entry/136455
-https://codeforces.com/blog/entry/137623
-https://codeforces.com/blog/entry/137801
