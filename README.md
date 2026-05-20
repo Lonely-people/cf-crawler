@@ -46,6 +46,15 @@ https://codeforces.com/problemset/problem/2230/D
 
 同一 Contest 的多道题目会自动共享一次 Editorial 爬取，每题输出独立的 `{problemCode}.md` 文件。
 
+### 一键运行
+
+```bash
+./run.sh                 # 默认读取 problems.txt
+./run.sh my_problems.txt # 指定其他文件
+```
+
+自动完成：清除旧内容 → 查找 Editorial URL → 按题目拆分爬取。
+
 ### 辅助：查找 Editorial URL
 
 ```bash
@@ -61,7 +70,7 @@ python find_editorial_urls.py -p "https://codeforces.com/contest/2230/problem/A"
 | `-o, --output` | 输出文件 | `urls.txt` |
 | `-d, --delay` | 请求间隔（秒） | `5.0` |
 
-### 完整工作流
+### 手动工作流
 
 ```bash
 # 1. 从题目 URL 查找到 Editorial Blog Entry URL → 输出到 urls.txt
