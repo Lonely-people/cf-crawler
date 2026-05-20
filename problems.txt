@@ -1,0 +1,6 @@
+# Codeforces 题目 URL - 每行一个，脚本会自动查找对应的 Editorial Blog Entry 并追加到 urls.txt
+https://codeforces.com/contest/2230/problem/A
+https://codeforces.com/contest/2230/problem/B
+https://codeforces.com/contest/2230/problem/C
+https://codeforces.com/problemset/problem/2230/D
+https://codeforces.com/contest/2230/problem/E
