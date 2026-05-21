@@ -16,17 +16,21 @@ Codeforces Blog Crawler
 """
 
 import argparse
+import datetime
 import json
+import logging
 import os
 import re
+import signal
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from markdownify import markdownify as md
 
 
@@ -45,32 +49,192 @@ HEADERS = {
 
 REQUEST_TIMEOUT = 90  # 秒
 DELAY_BETWEEN_REQUESTS = 10.0  # 请求间隔（秒），避免被封
+MAX_RETRIES = 3               # 网络错误最大重试次数
+RETRY_BACKOFF = 5.0           # 重试退避基础秒数
+
+# 断点续传 / 日志 / 错误收集
+CHECKPOINT_FILE = ".crawler_checkpoint.json"
+FAILED_URLS_FILE = "failed_urls.txt"
+LOG_FILE = "crawler.log"
+
+# 进度条宽度
+PROGRESS_BAR_WIDTH = 40
+
+# 全局中断标志
+_interrupted = False
+
+
+def _signal_handler(signum, frame):
+    global _interrupted
+    _interrupted = True
+    print("\n[WARN] 收到中断信号，正在安全退出...", file=sys.stderr)
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+
+
+# ---------------------------------------------------------------------------
+# 日志
+# ---------------------------------------------------------------------------
+_logger: Optional[logging.Logger] = None
+
+
+def setup_logging(verbose: bool = False):
+    """配置日志：同时输出到控制台和文件。"""
+    global _logger
+    _logger = logging.getLogger("cf-crawler")
+    _logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    _logger.handlers.clear()
+
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
+    )
+
+    # 控制台
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.DEBUG if verbose else logging.INFO)
+    ch.setFormatter(fmt)
+    _logger.addHandler(ch)
+
+    # 文件
+    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    _logger.addHandler(fh)
+
+    return _logger
+
+
+def log() -> logging.Logger:
+    return _logger or logging.getLogger("cf-crawler")
+
+
+# ---------------------------------------------------------------------------
+# 网络重试
+# ---------------------------------------------------------------------------
+def retry_on_network_error(func, max_retries=MAX_RETRIES, backoff=RETRY_BACKOFF):
+    """装饰器：网络错误时自动重试，指数退避。"""
+    def wrapper(*args, **kwargs):
+        last_exc = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                return func(*args, **kwargs)
+            except (requests.ConnectionError, requests.Timeout) as e:
+                last_exc = e
+                if attempt < max_retries:
+                    wait = backoff * (2 ** (attempt - 1))
+                    log().warning(
+                        "网络错误 (尝试 %d/%d): %s，%ds 后重试...",
+                        attempt, max_retries, e, wait,
+                    )
+                    time.sleep(wait)
+                else:
+                    log().error("网络错误，已达最大重试次数: %s", e)
+            except requests.HTTPError as e:
+                last_exc = e
+                status = e.response.status_code if hasattr(e, 'response') else '?'
+                if attempt < max_retries and status in (429, 502, 503, 504):
+                    wait = backoff * (2 ** (attempt - 1))
+                    log().warning(
+                        "HTTP %s (尝试 %d/%d)，%ds 后重试...",
+                        status, attempt, max_retries, wait,
+                    )
+                    time.sleep(wait)
+                else:
+                    log().error("HTTP 错误: %s", e)
+                    raise
+            except requests.RequestException as e:
+                last_exc = e
+                log().error("请求异常: %s", e)
+                raise
+        raise last_exc
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
+# 断点续传
+# ---------------------------------------------------------------------------
+def load_checkpoint() -> Optional[dict]:
+    """加载上次运行的断点信息。"""
+    if os.path.exists(CHECKPOINT_FILE):
+        try:
+            with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return None
+    return None
+
+
+def save_checkpoint(state: dict):
+    """保存断点信息。"""
+    state["updated_at"] = datetime.datetime.now().isoformat()
+    with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def clear_checkpoint():
+    """清除断点文件。"""
+    if os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
+
+
+def append_failed_url(url: str, reason: str = ""):
+    """追加失败 URL 到 failed_urls.txt。"""
+    with open(FAILED_URLS_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{url}")
+        if reason:
+            f.write(f"  # {reason}")
+        f.write("\n")
+
+
+# ---------------------------------------------------------------------------
+# 进度条
+# ---------------------------------------------------------------------------
+def render_progress_bar(current: int, total: int, start_time: float, label: str = "") -> str:
+    """渲染进度条字符串。"""
+    if total <= 0:
+        return ""
+    ratio = current / total
+    filled = int(PROGRESS_BAR_WIDTH * ratio)
+    bar = "█" * filled + "░" * (PROGRESS_BAR_WIDTH - filled)
+
+    elapsed = time.time() - start_time
+    if current > 0:
+        eta = (elapsed / current) * (total - current)
+        eta_str = str(datetime.timedelta(seconds=int(eta)))
+    else:
+        eta_str = "--:--"
+
+    elapsed_str = str(datetime.timedelta(seconds=int(elapsed)))
+    percent = f"{ratio * 100:.1f}%"
+
+    return f"  {label}[{bar}] {current}/{total} ({percent}) | ⏱ {elapsed_str} | ETA {eta_str}"
 
 
 # ---------------------------------------------------------------------------
 # 核心逻辑
 # ---------------------------------------------------------------------------
 def fetch_page(url: str, session: requests.Session = None) -> Optional[str]:
-    """获取页面 HTML，失败返回 None。"""
+    """获取页面 HTML，失败返回 None。支持自动重试。"""
     fetcher = session if session else requests
-    try:
+
+    @retry_on_network_error
+    def _do_fetch():
         resp = fetcher.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.text
+
+    try:
+        return _do_fetch()
     except requests.RequestException as e:
-        print(f"[ERROR] 获取页面失败: {url} —— {e}", file=sys.stderr)
+        log().error("获取页面失败: %s —— %s", url, e)
         return None
 
 
 def fetch_tutorial_content(
     session: requests.Session, problem_code: str, csrf_token: str = None
 ) -> Optional[str]:
-    """通过 AJAX API 获取题解 Tutorial 的真实内容。
-
-    Codeforces 的 editorial 页面中，Tutorial 折叠块通过 JS 异步加载，
-    POST 到 /data/problemTutorial 获取实际内容。
-    需要携带从博客页面提取的 CSRF Token。
-    """
+    """通过 AJAX API 获取题解 Tutorial 的真实内容。"""
     api_url = "https://codeforces.com/data/problemTutorial"
     ajax_headers = {
         **HEADERS,
@@ -81,7 +245,9 @@ def fetch_tutorial_content(
     }
     if csrf_token:
         ajax_headers["X-Csrf-Token"] = csrf_token
-    try:
+
+    @retry_on_network_error
+    def _do_fetch():
         resp = session.post(
             api_url,
             data={"problemCode": problem_code},
@@ -89,20 +255,18 @@ def fetch_tutorial_content(
             timeout=REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
+        return resp
+
+    try:
+        resp = _do_fetch()
         result = resp.json()
         if result.get("success") == "true":
             return result.get("html", "")
         else:
-            print(
-                f"  [WARN] Tutorial API 返回失败: {problem_code}",
-                file=sys.stderr,
-            )
+            log().warning("Tutorial API 返回失败: %s", problem_code)
             return None
     except (requests.RequestException, json.JSONDecodeError) as e:
-        print(
-            f"  [WARN] 获取 Tutorial 失败 ({problem_code}): {e}",
-            file=sys.stderr,
-        )
+        log().warning("获取 Tutorial 失败 (%s): %s", problem_code, e)
         return None
 
 
@@ -147,13 +311,13 @@ def parse_blog(
     # ---- 正文 ----
     content_div = soup.select_one("div.content")
     if not content_div:
-        print(f"[ERROR] 未找到正文内容: {url}", file=sys.stderr)
+        log().error("未找到正文内容: %s", url)
         return None
 
     # 正文是 content 下的第一个 ttypography div
     body_div = content_div.select_one("div.ttypography")
     if not body_div:
-        print(f"[ERROR] 未找到博客正文: {url}", file=sys.stderr)
+        log().error("未找到博客正文: %s", url)
         return None
 
     # ---- 异步加载的 Tutorial 占位符替换 ----
@@ -163,23 +327,20 @@ def parse_blog(
         csrf_meta = soup.find("meta", attrs={"name": "X-Csrf-Token"})
         csrf_token = csrf_meta.get("content", "") if csrf_meta else ""
 
-        print(f"  检测到 {len(tutorial_placeholders)} 个 Tutorial 占位符，正在获取真实内容...")
+        log().info("检测到 %d 个 Tutorial 占位符，正在获取真实内容...", len(tutorial_placeholders))
         for placeholder in tutorial_placeholders:
             problem_code = placeholder.get("problemcode", "")
             if not problem_code:
                 continue
             real_html = fetch_tutorial_content(session, problem_code, csrf_token)
             if real_html:
-                # 将 API 返回的 HTML 解析后替换占位符
                 real_fragment = BeautifulSoup(real_html, "html.parser")
                 placeholder.clear()
                 placeholder.append(real_fragment)
-                print(f"    ✓ Tutorial {problem_code} 获取成功")
+                log().info("  ✓ Tutorial %s 获取成功", problem_code)
             else:
-                # 保留占位文本，但加上标记
                 placeholder.string = f"*Tutorial for {problem_code} is not available.*"
-                print(f"    ✗ Tutorial {problem_code} 获取失败，保留占位")
-            # 请求间隔（对 API 也适用）
+                log().warning("  ✗ Tutorial %s 获取失败，保留占位", problem_code)
             time.sleep(0.5)
 
     # 移除 MathJax 脚本（保留 LaTeX 源码即可）
@@ -300,14 +461,19 @@ def _search_editorial_on_page(
     session: requests.Session, url: str
 ) -> Optional[str]:
     """在给定页面中搜索 Editorial 的 Blog Entry 链接。"""
-    try:
+    @retry_on_network_error
+    def _do_fetch():
         resp = session.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
+        return resp.text
+
+    try:
+        html = _do_fetch()
     except requests.RequestException as e:
-        print(f"  [WARN] 无法访问页面 {url}: {e}", file=sys.stderr)
+        log().warning("无法访问页面 %s: %s", url, e)
         return None
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    soup = BeautifulSoup(html, "html.parser")
     for a_tag in soup.find_all("a", href=re.compile(r"/blog/entry/\d+")):
         link_text = a_tag.get_text(strip=True).lower()
         title_attr = (a_tag.get("title") or "").lower()
@@ -326,8 +492,6 @@ def split_body_by_problem(body_div) -> dict:
     返回 {problem_code: html_fragment_str} 的字典。
     problem_code 形如 "2230A", "2230B"。
     """
-    from bs4 import Tag
-
     sections = {}
     current_code = None
     current_elements = []
@@ -417,101 +581,189 @@ def build_problem_markdown(
 def crawl_problems(
     problem_urls: list[str],
     output_dir: str,
+    resume: bool = False,
 ) -> list[dict]:
     """按题目爬取：查找 editorial → 拆分 → 按题目输出 Markdown。
 
-    工作流:
-      1. 按 editorial URL 对题目分组
-      2. 每组只爬取一次 editorial
-      3. 将 editorial 正文按题目拆分
-      4. 每个题目输出单独的 .md 文件
+    支持断点续传：中断后下次运行可从中断处继续。
+    支持进度条、错误收集、实时保存。
     """
+    global _interrupted
     os.makedirs(output_dir, exist_ok=True)
     results = []
+    failed_urls = []
 
     session = requests.Session()
     session.headers.update(HEADERS)
+    overall_start = time.time()
 
-    # ---- 第一步：为每个题目查找 editorial URL ----
-    problem_info: dict[str, dict] = {}  # problem_url → {contest_id, problem_code, editorial_url}
+    # ---- 断点续传：加载上次进度 ----
+    checkpoint = load_checkpoint() if resume else None
+    already_found: dict[str, dict] = {}
+    already_crawled: set = set()
+    phase = 1  # 1=查找editorial, 2=爬取拆分
+
+    if checkpoint:
+        already_found = {k: v for k, v in checkpoint.get("found_editorials", {}).items()}
+        already_crawled = set(checkpoint.get("crawled_problems", []))
+        phase = checkpoint.get("phase", 1)
+        log().info("断点续传：已恢复 %d 个 editorial 映射，%d 个已爬取题目",
+                    len(already_found), len(already_crawled))
+        if phase >= 2:
+            log().info("上次已进入阶段 2，跳过 Editorial 查找")
+
+    # ---- 第一阶段：查找 Editorial URL ----
     editorial_to_problems: dict[str, list[str]] = {}  # editorial_url → [problem_url, ...]
+    problem_info: dict[str, dict] = {}
 
-    print("=" * 50)
-    print("第一步：查找各题目对应的 Editorial...")
-    print("-" * 50)
+    # 恢复已有的映射
+    for purl, info in already_found.items():
+        eurl = info.get("editorial_url", "")
+        if eurl:
+            editorial_to_problems.setdefault(eurl, []).append(purl)
+            problem_info[purl] = info
 
-    for i, problem_url in enumerate(problem_urls, 1):
-        problem_url = problem_url.strip()
-        if not problem_url or problem_url.startswith("#"):
-            continue
+    if phase == 1:
+        log().info("=" * 50)
+        log().info("第一步：查找各题目对应的 Editorial...")
+        log().info("-" * 50)
 
-        contest_id = extract_contest_id(problem_url)
-        problem_code = extract_problem_code(problem_url)
-        if not contest_id or not problem_code:
-            print(f"[{i}/{len(problem_urls)}] ✗ 无法解析: {problem_url}")
-            results.append({"url": problem_url, "success": False, "error": "parse url failed"})
-            continue
+        total = len(problem_urls)
+        step_start = time.time()
 
-        editorial_url = find_editorial_url(session, contest_id, problem_url)
-        if not editorial_url:
-            print(f"[{i}/{len(problem_urls)}] ✗ 未找到 Editorial: {problem_url}")
-            results.append({"url": problem_url, "success": False, "error": "editorial not found"})
-        else:
-            print(f"[{i}/{len(problem_urls)}] ✓ {problem_code} → {editorial_url}")
-            problem_info[problem_url] = {
-                "contest_id": contest_id,
-                "problem_code": problem_code,
-                "editorial_url": editorial_url,
-            }
-            editorial_to_problems.setdefault(editorial_url, []).append(problem_url)
+        for i, problem_url in enumerate(problem_urls, 1):
+            if _interrupted:
+                log().warning("收到中断信号，保存进度后退出...")
+                break
 
-        if i < len(problem_urls):
-            time.sleep(DELAY_BETWEEN_REQUESTS)
+            problem_url = problem_url.strip()
+            if not problem_url or problem_url.startswith("#"):
+                continue
+
+            # 跳过已找到的
+            if problem_url in already_found:
+                log().info("[%d/%d] ⏭ %s（已有缓存）", i, total,
+                           already_found[problem_url].get("problem_code", ""))
+                continue
+
+            contest_id = extract_contest_id(problem_url)
+            problem_code = extract_problem_code(problem_url)
+            if not contest_id or not problem_code:
+                log().warning("[%d/%d] ✗ 无法解析: %s", i, total, problem_url)
+                failed_urls.append((problem_url, "parse url failed"))
+                results.append({"url": problem_url, "success": False, "error": "parse url failed"})
+                continue
+
+            editorial_url = find_editorial_url(session, contest_id, problem_url)
+            if not editorial_url:
+                log().warning("[%d/%d] ✗ 未找到 Editorial: %s", i, total, problem_url)
+                failed_urls.append((problem_url, "editorial not found"))
+                results.append({"url": problem_url, "success": False, "error": "editorial not found"})
+            else:
+                log().info("[%d/%d] ✓ %s → %s", i, total, problem_code, editorial_url)
+                info = {
+                    "contest_id": contest_id,
+                    "problem_code": problem_code,
+                    "editorial_url": editorial_url,
+                }
+                problem_info[problem_url] = info
+                already_found[problem_url] = info
+                editorial_to_problems.setdefault(editorial_url, []).append(problem_url)
+
+                # ★ 实时保存 checkpoint
+                save_checkpoint({
+                    "phase": 1,
+                    "found_editorials": already_found,
+                    "crawled_problems": list(already_crawled),
+                })
+
+            # 进度条
+            bar = render_progress_bar(i, total, step_start, "查找 Editorial: ")
+            sys.stdout.write(f"\r{bar}")
+            sys.stdout.flush()
+
+            if i < total and not _interrupted:
+                time.sleep(DELAY_BETWEEN_REQUESTS)
+
+        print()  # 换行
+        log().info("第一阶段完成，找到 %d 个 Editorial", len(editorial_to_problems))
+        phase = 2
 
     if not problem_info:
-        print("\n[ERROR] 没有找到任何有效的 Editorial URL")
+        log().error("没有找到任何有效的 Editorial URL")
+        _save_failed_urls(failed_urls)
         return results
 
-    # ---- 第二步：爬取 editorial 并按题目拆分输出 ----
-    print("\n" + "=" * 50)
-    print("第二步：爬取 Editorial 并按题目拆分输出...")
-    print("-" * 50)
+    # ---- 第二阶段：爬取 editorial 并按题目拆分输出 ----
+    log().info("=" * 50)
+    log().info("第二步：爬取 Editorial 并按题目拆分输出...")
+    log().info("-" * 50)
 
     editorial_count = len(editorial_to_problems)
+    step_start = time.time()
+    processed_count = 0
+    total_problems = sum(len(v) for v in editorial_to_problems.values())
+
     for ei, (editorial_url, probs) in enumerate(editorial_to_problems.items(), 1):
-        print(f"\n[Editorial {ei}/{editorial_count}] 正在爬取: {editorial_url}")
+        if _interrupted:
+            log().warning("收到中断信号，保存进度后退出...")
+            break
+
+        # 检查该 editorial 的所有题目是否都已爬取
+        remaining = [p for p in probs if p not in already_crawled]
+        if not remaining:
+            log().info("[Editorial %d/%d] ⏭ %s（全部已爬取，跳过）",
+                       ei, editorial_count, editorial_url)
+            processed_count += len(probs)
+            bar = render_progress_bar(processed_count, total_problems, step_start, "爬取 Tutorial: ")
+            sys.stdout.write(f"\r{bar}")
+            sys.stdout.flush()
+            continue
+
+        log().info("[Editorial %d/%d] 正在爬取: %s", ei, editorial_count, editorial_url)
 
         html = fetch_page(editorial_url, session=session)
         if not html:
-            for pu in probs:
+            for pu in remaining:
+                log().warning("  ✗ Editorial 获取失败: %s", pu)
+                failed_urls.append((pu, "fetch editorial failed"))
                 results.append({"url": pu, "success": False, "error": "fetch editorial failed"})
+            processed_count += len(probs)
             continue
 
         blog = parse_blog(html, editorial_url, session=session)
         if not blog:
-            for pu in probs:
+            for pu in remaining:
+                log().warning("  ✗ Editorial 解析失败: %s", pu)
+                failed_urls.append((pu, "parse editorial failed"))
                 results.append({"url": pu, "success": False, "error": "parse editorial failed"})
+            processed_count += len(probs)
             continue
 
-        # 使用 parse_blog 中已替换好 Tutorial 内容的 body_div 进行拆分
         body_div2 = blog.get("_body_div")
         if not body_div2:
-            for pu in probs:
+            for pu in remaining:
+                failed_urls.append((pu, "body not found"))
                 results.append({"url": pu, "success": False, "error": "body not found"})
+            processed_count += len(probs)
             continue
 
-        # 拆分 editorial 正文
         sections = split_body_by_problem(body_div2)
-        print(f"  拆分出 {len(sections)} 个题目 section")
+        log().info("  拆分出 %d 个题目 section", len(sections))
 
-        # 为属于这个 editorial 的每个题目输出文件
         for problem_url in probs:
+            if problem_url in already_crawled:
+                continue
+
             info = problem_info.get(problem_url, {})
             problem_code = info.get("problem_code", extract_problem_code(problem_url) or "unknown")
 
             if problem_code not in sections:
-                print(f"  ✗ 未在 Editorial 中找到 {problem_code} 的 section")
+                log().warning("  ✗ 未在 Editorial 中找到 %s 的 section", problem_code)
+                failed_urls.append((problem_url, "section not found"))
                 results.append({"url": problem_url, "success": False, "error": "section not found"})
+                already_crawled.add(problem_url)
+                processed_count += 1
                 continue
 
             section_html = sections[problem_code]
@@ -526,18 +778,63 @@ def crawl_problems(
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(md_content)
 
-            print(f"  ✓ {problem_code} → {filepath}")
+            log().info("  ✓ %s → %s", problem_code, filepath)
             results.append({
                 "url": problem_url,
                 "success": True,
                 "filepath": filepath,
                 "problem_code": problem_code,
             })
+            already_crawled.add(problem_url)
+            processed_count += 1
 
-        if ei < editorial_count:
+            # ★ 实时保存 checkpoint
+            save_checkpoint({
+                "phase": 2,
+                "found_editorials": already_found,
+                "crawled_problems": list(already_crawled),
+            })
+
+            bar = render_progress_bar(processed_count, total_problems, step_start, "爬取 Tutorial: ")
+            sys.stdout.write(f"\r{bar}")
+            sys.stdout.flush()
+
+            if _interrupted:
+                break
+
+        if ei < editorial_count and not _interrupted:
             time.sleep(DELAY_BETWEEN_REQUESTS)
 
+    print()  # 换行
+
+    # ---- 清理 ----
+    if not _interrupted:
+        clear_checkpoint()
+        log().info("全部完成，已清除断点文件")
+
+    _save_failed_urls(failed_urls)
+
+    elapsed = time.time() - overall_start
+    log().info("总耗时: %s", str(datetime.timedelta(seconds=int(elapsed))))
+
     return results
+
+
+def _save_failed_urls(failed: list):
+    """保存失败的 URL 列表。"""
+    if not failed:
+        # 清空旧文件
+        if os.path.exists(FAILED_URLS_FILE):
+            os.remove(FAILED_URLS_FILE)
+        return
+    seen = set()
+    with open(FAILED_URLS_FILE, "w", encoding="utf-8") as f:
+        f.write("# 爬取失败的 URL\n")
+        for url, reason in failed:
+            if url not in seen:
+                seen.add(url)
+                f.write(f"{url}  # {reason}\n")
+    log().warning("%d 个 URL 爬取失败，已记录到 %s", len(seen), FAILED_URLS_FILE)
 
 
 def sanitize_filename(name: str) -> str:
@@ -549,31 +846,48 @@ def sanitize_filename(name: str) -> str:
 
 def crawl_urls(urls: list[str], output_dir: str) -> list[dict]:
     """批量爬取 URL 列表，保存 Markdown，返回结果列表。"""
+    global _interrupted
     os.makedirs(output_dir, exist_ok=True)
     results = []
+    failed_urls = []
 
-    # 使用 Session 保持 cookie，避免 Cloudflare 拦截对 /data/problemTutorial 的请求
     session = requests.Session()
     session.headers.update(HEADERS)
 
+    total = len(urls)
+    start_time = time.time()
+
     for i, url in enumerate(urls, 1):
+        if _interrupted:
+            log().warning("收到中断信号，停止爬取")
+            break
+
         url = url.strip()
         if not url or url.startswith("#"):
             continue
 
-        print(f"[{i}/{len(urls)}] 正在爬取: {url}")
+        log().info("[%d/%d] 正在爬取: %s", i, total, url)
 
         html = fetch_page(url, session=session)
         if not html:
+            log().error("[%d/%d] ✗ 获取页面失败: %s", i, total, url)
+            failed_urls.append((url, "fetch failed"))
             results.append({"url": url, "success": False, "error": "fetch failed"})
+            bar = render_progress_bar(i, total, start_time, "Blog 爬取: ")
+            sys.stdout.write(f"\r{bar}")
+            sys.stdout.flush()
             continue
 
         blog = parse_blog(html, url, session=session)
         if not blog:
+            log().error("[%d/%d] ✗ 解析失败: %s", i, total, url)
+            failed_urls.append((url, "parse failed"))
             results.append({"url": url, "success": False, "error": "parse failed"})
+            bar = render_progress_bar(i, total, start_time, "Blog 爬取: ")
+            sys.stdout.write(f"\r{bar}")
+            sys.stdout.flush()
             continue
 
-        # 生成文件名: {entry_id}_{title}.md
         safe_title = sanitize_filename(blog["title"])
         filename = f"{blog['entry_id']}_{safe_title}.md"
         filepath = os.path.join(output_dir, filename)
@@ -582,12 +896,20 @@ def crawl_urls(urls: list[str], output_dir: str) -> list[dict]:
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(md_content)
 
-        print(f"  ✓ 已保存: {filepath}")
+        log().info("  ✓ 已保存: %s", filepath)
         results.append({"url": url, "success": True, "filepath": filepath, **blog})
 
-        # 请求间隔
-        if i < len(urls):
+        bar = render_progress_bar(i, total, start_time, "Blog 爬取: ")
+        sys.stdout.write(f"\r{bar}")
+        sys.stdout.flush()
+
+        if i < total and not _interrupted:
             time.sleep(DELAY_BETWEEN_REQUESTS)
+
+    print()  # 换行
+    _save_failed_urls(failed_urls)
+    elapsed = time.time() - start_time
+    log().info("总耗时: %s", str(datetime.timedelta(seconds=int(elapsed))))
 
     return results
 
@@ -628,9 +950,21 @@ def main():
         default=_default_delay,
         help=f"请求间隔秒数 (默认: {_default_delay})",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="从上次中断处继续（断点续传）",
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="详细日志输出（DEBUG 级别）",
+    )
 
     args = parser.parse_args()
 
+    # 初始化日志
+    setup_logging(verbose=args.verbose)
     DELAY_BETWEEN_REQUESTS = args.delay
 
     # ---- Problem 模式 ----
@@ -642,22 +976,19 @@ def main():
             ]
 
         if not problem_urls:
-            print(
-                f"[ERROR] 文件 {args.problems_file} 中没有有效的题目 URL",
-                file=sys.stderr,
-            )
+            log().error("文件 %s 中没有有效的题目 URL", args.problems_file)
             sys.exit(1)
 
-        print(f"Problem 模式：共 {len(problem_urls)} 个题目 URL 待处理")
-        print(f"输出目录: {args.output_dir}")
-        print("-" * 50)
+        log().info("Problem 模式：共 %d 个题目 URL 待处理", len(problem_urls))
+        log().info("输出目录: %s", args.output_dir)
+        log().info("-" * 50)
 
-        results = crawl_problems(problem_urls, args.output_dir)
+        results = crawl_problems(problem_urls, args.output_dir, resume=args.resume)
 
         success = sum(1 for r in results if r["success"])
         fail = len(results) - success
-        print("\n" + "-" * 50)
-        print(f"完成！成功: {success}, 失败: {fail}")
+        log().info("-" * 50)
+        log().info("完成！成功: %d, 失败: %d", success, fail)
         return
 
     # ---- Blog 模式 ----
@@ -673,18 +1004,18 @@ def main():
 
     if not urls:
         parser.print_help()
-        print("\n[ERROR] 请提供至少一个 URL（通过文件或 -u 参数）", file=sys.stderr)
+        log().error("请提供至少一个 URL（通过文件或 -u 参数）")
         sys.exit(1)
 
-    print(f"共 {len(urls)} 个 URL 待爬取，输出目录: {args.output_dir}")
-    print("-" * 50)
+    log().info("共 %d 个 URL 待爬取，输出目录: %s", len(urls), args.output_dir)
+    log().info("-" * 50)
 
     results = crawl_urls(urls, args.output_dir)
 
     success = sum(1 for r in results if r["success"])
     fail = len(results) - success
-    print("-" * 50)
-    print(f"完成！成功: {success}, 失败: {fail}")
+    log().info("-" * 50)
+    log().info("完成！成功: %d, 失败: %d", success, fail)
 
 
 if __name__ == "__main__":

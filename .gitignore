@@ -5,3 +5,6 @@ __pycache__/
 tutorials/
 urls.txt
 problems.txt
+.crawler_checkpoint.json
+failed_urls.txt
+crawler.log
