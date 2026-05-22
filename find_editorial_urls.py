@@ -122,7 +122,7 @@ def _evaluate_editorial(blog_url: str, session: requests.Session) -> tuple:
     except requests.RequestException:
         return (False, 0)
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    soup = BeautifulSoup(resp.text, "lxml")
     is_video = False
 
     # 检查标题
@@ -162,7 +162,7 @@ def _find_all_editorial_links(
         print(f"  [WARN] 无法访问页面 {url}: {e}", file=sys.stderr)
         return []
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    soup = BeautifulSoup(resp.text, "lxml")
     results = []
     for a_tag in soup.find_all("a", href=re.compile(r"/blog/entry/\d+")):
         link_text = a_tag.get_text(strip=True).lower()

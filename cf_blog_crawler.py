@@ -278,7 +278,7 @@ def parse_blog(
     如果提供了 session 且页面包含 problemTutorial 占位符，
     会通过 AJAX API 获取真实的 Tutorial 内容进行替换。
     """
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
 
     # ---- 标题 ----
     title_tag = soup.select_one("div.title a p")
@@ -334,7 +334,7 @@ def parse_blog(
                 continue
             real_html = fetch_tutorial_content(session, problem_code, csrf_token)
             if real_html:
-                real_fragment = BeautifulSoup(real_html, "html.parser")
+                real_fragment = BeautifulSoup(real_html, "lxml")
                 placeholder.clear()
                 placeholder.append(real_fragment)
                 log().info("  ✓ Tutorial %s 获取成功", problem_code)
@@ -496,7 +496,7 @@ def _evaluate_editorial(blog_url: str, session: requests.Session) -> tuple:
     except requests.RequestException:
         return (False, 0)
 
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
     is_video = False
 
     # 检查标题
@@ -543,7 +543,7 @@ def _find_all_editorial_links(
         log().warning("无法访问页面 %s: %s", url, e)
         return []
 
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
     results = []
     for a_tag in soup.find_all("a", href=re.compile(r"/blog/entry/\d+")):
         link_text = a_tag.get_text(strip=True).lower()
@@ -688,7 +688,7 @@ def build_problem_markdown(
 ) -> str:
     """为单个题目生成 Markdown 文件内容。"""
     # 将 section HTML 中的相对链接补全
-    soup = BeautifulSoup(section_html, "html.parser")
+    soup = BeautifulSoup(section_html, "lxml")
     for a_tag in soup.find_all("a"):
         href = a_tag.get("href", "")
         if href.startswith("/"):
