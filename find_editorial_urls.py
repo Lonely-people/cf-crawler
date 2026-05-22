@@ -49,7 +49,7 @@ HEADERS = {
 }
 
 REQUEST_TIMEOUT = 90  # 秒
-DEFAULT_DELAY = 10.0   # 默认请求间隔（秒），避免被封 IP
+DEFAULT_DELAY = 7.0   # 默认请求间隔（秒），避免被封 IP
 
 # 已知的 editorial 链接锚文本/标题关键词（大小写不敏感）
 EDITORIAL_KEYWORDS = [
@@ -87,49 +87,95 @@ def find_editorial_url(
 ) -> Optional[str]:
     """根据 contest ID 查找对应的 Editorial Blog Entry URL。
 
-    策略:
-      1. 访问 contest 页面 /contest/{contestId}
-      2. 在侧边栏查找文字为 "Tutorial" 或 title 含 "Editorial" 的 /blog/entry/ 链接
-      3. 如果 contest 页面找不到，回退到访问 problem 页面查找
+    优先级：文字 > 视频；覆盖题目多 > 覆盖题目少。
     """
     # 策略 1：contest 页面
     contest_url = f"https://codeforces.com/contest/{contest_id}"
-    editorial = _search_editorial_on_page(session, contest_url)
-    if editorial:
-        return editorial
+    candidates = _find_all_editorial_links(session, contest_url)
+    # 策略 2：problem 页面回退
+    if not candidates:
+        candidates = _find_all_editorial_links(session, problem_url)
 
-    # 策略 2：problem 页面
-    editorial = _search_editorial_on_page(session, problem_url)
-    return editorial
+    if not candidates:
+        return None
+
+    # 评分并排序：优先文字 Editorial，其次选覆盖题目最多的
+    scored = []
+    for url in candidates:
+        is_video, problem_count = _evaluate_editorial(url, session)
+        if not is_video:
+            scored.append((problem_count, url))
+
+    if scored:
+        scored.sort(reverse=True)
+        return scored[0][1]
+
+    print(f"  [WARN] 所有 Editorial 均为视频题解，跳过 Contest {contest_id}", file=sys.stderr)
+    return None
 
 
-def _search_editorial_on_page(
+def _evaluate_editorial(blog_url: str, session: requests.Session) -> tuple:
+    """评估 Editorial 质量，返回 (is_video, problem_count)。"""
+    try:
+        resp = session.get(blog_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+    except requests.RequestException:
+        return (False, 0)
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    is_video = False
+
+    # 检查标题
+    title_tag = soup.select_one("div.title a p")
+    if title_tag:
+        title = title_tag.get_text(strip=True).lower()
+        if "video editorial" in title:
+            is_video = True
+
+    # 检查 YouTube 嵌入
+    body = soup.select_one("div.content div.ttypography")
+    if body:
+        iframes = len(body.find_all("iframe"))
+        youtube_links = len(body.find_all("a", href=re.compile(r"youtube\.com|youtu\.be")))
+        if iframes >= 3 or youtube_links >= 5:
+            is_video = True
+
+    # 统计 problem code 数量
+    problem_codes = set()
+    if body:
+        for a_tag in body.find_all("a", href=re.compile(r"/contest/\d+/problem/\w+")):
+            m = re.search(r"/contest/(\d+)/problem/(\w+)", a_tag.get("href", ""))
+            if m:
+                problem_codes.add(m.group(1) + m.group(2))
+
+    return (is_video, len(problem_codes))
+
+
+def _find_all_editorial_links(
     session: requests.Session, url: str
-) -> Optional[str]:
-    """在给定页面中搜索 Editorial 的 Blog Entry 链接。"""
+) -> list[str]:
+    """在给定页面中搜索所有 Editorial Blog Entry 链接。"""
     try:
         resp = session.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
     except requests.RequestException as e:
         print(f"  [WARN] 无法访问页面 {url}: {e}", file=sys.stderr)
-        return None
+        return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
-
-    # 查找所有指向 /blog/entry/ 的链接
+    results = []
     for a_tag in soup.find_all("a", href=re.compile(r"/blog/entry/\d+")):
         link_text = a_tag.get_text(strip=True).lower()
         title_attr = (a_tag.get("title") or "").lower()
-
-        # 判断是否为 editorial 链接
         for keyword in EDITORIAL_KEYWORDS:
             if keyword in link_text or keyword in title_attr:
                 href = a_tag["href"]
                 if href.startswith("/"):
                     href = "https://codeforces.com" + href
-                return href
-
-    return None
+                if href not in results:
+                    results.append(href)
+                break
+    return results
 
 
 def read_existing_urls(output_file: str) -> Set[str]:

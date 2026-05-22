@@ -48,7 +48,7 @@ HEADERS = {
 }
 
 REQUEST_TIMEOUT = 90  # 秒
-DELAY_BETWEEN_REQUESTS = 10.0  # 请求间隔（秒），避免被封
+DELAY_BETWEEN_REQUESTS = 7.0  # 请求间隔（秒），避免被封
 MAX_RETRIES = 3               # 网络错误最大重试次数
 RETRY_BACKOFF = 5.0           # 重试退避基础秒数
 
@@ -447,20 +447,90 @@ def find_editorial_url(
     contest_id: str,
     problem_url: str,
 ) -> Optional[str]:
-    """根据 contest ID 查找对应的 Editorial Blog Entry URL。"""
+    """根据 contest ID 查找对应的 Editorial Blog Entry URL。
+
+    优先级：文字 > 视频；覆盖题目多 > 覆盖题目少。
+    """
     # 策略 1：contest 页面
     contest_url = f"https://codeforces.com/contest/{contest_id}"
-    editorial = _search_editorial_on_page(session, contest_url)
-    if editorial:
-        return editorial
+    candidates = _find_all_editorial_links(session, contest_url)
     # 策略 2：problem 页面回退
-    return _search_editorial_on_page(session, problem_url)
+    if not candidates:
+        candidates = _find_all_editorial_links(session, problem_url)
+
+    if not candidates:
+        return None
+
+    # 评分并排序：优先文字 Editorial，其次选覆盖题目最多的
+    scored = []
+    for url in candidates:
+        is_video, problem_count = _evaluate_editorial(url, session)
+        if not is_video:
+            scored.append((problem_count, url))
+
+    if scored:
+        scored.sort(reverse=True)  # problem_count 降序
+        best_count, best_url = scored[0]
+        log().info("  选择 Editorial: %s（覆盖 %d 道题）", best_url, best_count)
+        return best_url
+
+    log().warning("所有 Editorial 均为视频题解，跳过 Contest %s", contest_id)
+    return None
 
 
-def _search_editorial_on_page(
+def _evaluate_editorial(blog_url: str, session: requests.Session) -> tuple:
+    """评估 Editorial 质量。
+
+    返回 (is_video: bool, problem_count: int)。
+    - is_video: 标题含 "Video Editorial" 或大量 YouTube 嵌入
+    - problem_count: 正文中不同 problem code 的数量
+    """
+    try:
+        @retry_on_network_error
+        def _fetch():
+            resp = session.get(blog_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            return resp.text
+
+        html = _fetch()
+    except requests.RequestException:
+        return (False, 0)
+
+    soup = BeautifulSoup(html, "html.parser")
+    is_video = False
+
+    # 检查标题
+    title_tag = soup.select_one("div.title a p")
+    if title_tag:
+        title = title_tag.get_text(strip=True).lower()
+        if "video editorial" in title:
+            is_video = True
+
+    # 检查正文中的 YouTube 嵌入数量
+    body = soup.select_one("div.content div.ttypography")
+    iframes = 0
+    youtube_links = 0
+    if body:
+        iframes = len(body.find_all("iframe"))
+        youtube_links = len(body.find_all("a", href=re.compile(r"youtube\.com|youtu\.be")))
+        if iframes >= 3 or youtube_links >= 5:
+            is_video = True
+
+    # 统计正文中不同 problem code 的数量
+    problem_codes = set()
+    if body:
+        for a_tag in body.find_all("a", href=re.compile(r"/contest/\d+/problem/\w+")):
+            m = re.search(r"/contest/(\d+)/problem/(\w+)", a_tag.get("href", ""))
+            if m:
+                problem_codes.add(m.group(1) + m.group(2))
+
+    return (is_video, len(problem_codes))
+
+
+def _find_all_editorial_links(
     session: requests.Session, url: str
-) -> Optional[str]:
-    """在给定页面中搜索 Editorial 的 Blog Entry 链接。"""
+) -> list[str]:
+    """在给定页面中搜索所有 Editorial Blog Entry 链接，返回 URL 列表。"""
     @retry_on_network_error
     def _do_fetch():
         resp = session.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
@@ -471,9 +541,10 @@ def _search_editorial_on_page(
         html = _do_fetch()
     except requests.RequestException as e:
         log().warning("无法访问页面 %s: %s", url, e)
-        return None
+        return []
 
     soup = BeautifulSoup(html, "html.parser")
+    results = []
     for a_tag in soup.find_all("a", href=re.compile(r"/blog/entry/\d+")):
         link_text = a_tag.get_text(strip=True).lower()
         title_attr = (a_tag.get("title") or "").lower()
@@ -482,8 +553,10 @@ def _search_editorial_on_page(
                 href = a_tag["href"]
                 if href.startswith("/"):
                     href = "https://codeforces.com" + href
-                return href
-    return None
+                if href not in results:
+                    results.append(href)
+                break
+    return results
 
 
 def split_body_by_problem(body_div) -> dict:
@@ -750,6 +823,7 @@ def crawl_problems(
 
         sections = split_body_by_problem(body_div2)
         log().info("  拆分出 %d 个题目 section", len(sections))
+        _use_full_body = not sections  # 无法拆分时回退到完整 Editorial
 
         for problem_url in probs:
             if problem_url in already_crawled:
@@ -759,11 +833,45 @@ def crawl_problems(
             problem_code = info.get("problem_code", extract_problem_code(problem_url) or "unknown")
 
             if problem_code not in sections:
-                log().warning("  ✗ 未在 Editorial 中找到 %s 的 section", problem_code)
-                failed_urls.append((problem_url, "section not found"))
-                results.append({"url": problem_url, "success": False, "error": "section not found"})
-                already_crawled.add(problem_url)
-                processed_count += 1
+                if _use_full_body:
+                    # 非标准 editorial 格式或无法拆分：回退为保存完整 editorial 内容
+                    log().warning("  ⚠ Editorial 无法按题目拆分，保存完整内容作为 %s 的 Tutorial", problem_code)
+                    safe_code = sanitize_filename(problem_code)
+                    filename = f"{safe_code}.md"
+                    filepath = os.path.join(output_dir, filename)
+
+                    # 使用 blog 中的完整 body_md
+                    md_content = build_problem_markdown(
+                        problem_url, problem_code,
+                        str(body_div2), blog
+                    )
+                    with open(filepath, "w", encoding="utf-8") as f:
+                        f.write(md_content)
+
+                    log().info("  ✓ %s → %s（非标准格式，完整 Editorial）", problem_code, filepath)
+                    results.append({
+                        "url": problem_url,
+                        "success": True,
+                        "filepath": filepath,
+                        "problem_code": problem_code,
+                    })
+                    already_crawled.add(problem_url)
+                    processed_count += 1
+                else:
+                    log().warning("  ✗ 未在 Editorial 中找到 %s 的 section", problem_code)
+                    failed_urls.append((problem_url, "section not found"))
+                    results.append({"url": problem_url, "success": False, "error": "section not found"})
+                    already_crawled.add(problem_url)
+                    processed_count += 1
+                # ★ 实时保存 checkpoint
+                save_checkpoint({
+                    "phase": 2,
+                    "found_editorials": already_found,
+                    "crawled_problems": list(already_crawled),
+                })
+                bar = render_progress_bar(processed_count, total_problems, step_start, "爬取 Tutorial: ")
+                sys.stdout.write(f"\r{bar}")
+                sys.stdout.flush()
                 continue
 
             section_html = sections[problem_code]
