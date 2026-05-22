@@ -562,26 +562,96 @@ def _find_all_editorial_links(
 def split_body_by_problem(body_div) -> dict:
     """将 editorial 正文按题目拆分为多个 section。
 
-    返回 {problem_code: html_fragment_str} 的字典。
-    problem_code 形如 "2230A", "2230B"。
+    策略（按优先级）:
+      1. 通过 problemTutorial[problemcode] 锚点定位（最可靠，覆盖 AJAX 格式）
+      2. 回退到扫描 <p>/<h2> 中的 /contest/{id}/problem/{code} 链接
     """
+    # ---- 策略 1：problemTutorial 锚点 ----
+    sections = _split_by_tutorial_divs(body_div)
+    if sections:
+        return sections
+
+    # ---- 策略 2：链接扫描回退 ----
+    return _split_by_problem_links(body_div)
+
+
+def _split_by_tutorial_divs(body_div) -> dict:
+    """通过 problemTutorial[problemcode] 锚点拆分 editorial。
+
+    每个题目的 section 包括:
+      - 题目标题 + 作者信息（向前追溯到最近的 problem 链接所在元素）
+      - Tutorial spoiler（包含已替换的 AJAX 内容）
+      - Solution spoiler（紧随 Tutorial 之后的第一个 spoiler）
+    """
+    tut_divs = body_div.select("div.problemTutorial[problemcode]")
+    if not tut_divs:
+        return {}
+
+    sections = {}
+    seen_codes = set()
+
+    for tut_div in tut_divs:
+        code = tut_div.get("problemcode", "").strip()
+        if not code or code in seen_codes:
+            continue
+        seen_codes.add(code)
+
+        parts = []
+
+        # 找到 Tutorial 所在的 spoiler 容器
+        tut_spoiler = tut_div.find_parent("div", class_="spoiler")
+
+        if tut_spoiler:
+            # 向前收集题目标题和作者信息
+            prev = tut_spoiler.find_previous_sibling()
+            title_parts = []
+            found_title = False
+            while prev is not None:
+                if not isinstance(prev, Tag):
+                    prev = prev.find_previous_sibling()
+                    continue
+                link = prev.find("a", href=re.compile(r"/contest/\d+/problem/\w+"))
+                if prev.name in ("p", "h1", "h2", "h3", "h4", "h5", "h6") and link:
+                    title_parts.insert(0, prev)
+                    found_title = True
+                    break
+                elif prev.name == "p" and not found_title:
+                    # 可能是 Idea/Author 信息行
+                    title_parts.insert(0, prev)
+                prev = prev.find_previous_sibling()
+
+            parts.extend(title_parts)
+
+            # 添加 Tutorial spoiler
+            parts.append(tut_spoiler)
+
+            # 添加紧随其后的 Solution spoiler
+            next_spoiler = tut_spoiler.find_next_sibling("div", class_="spoiler")
+            if next_spoiler:
+                parts.append(next_spoiler)
+
+        if parts:
+            sections[code] = "".join(str(p) for p in parts)
+
+    return sections
+
+
+def _split_by_problem_links(body_div) -> dict:
+    """通过扫描 <p>/<h2> 中的 /contest/{id}/problem/{code} 链接拆分 editorial（回退策略）。"""
     sections = {}
     current_code = None
     current_elements = []
     buf = []
 
     for child in body_div.children:
-        # 跳过非 Tag 节点（如 NavigableString）
         if not isinstance(child, Tag):
             buf.append(child)
             continue
 
-        # 检测题目标题：<p> 或 <h2>/<h3> 等块级元素内包含 /contest/{id}/problem/{code} 链接
         problem_link = child.find(
             "a", href=re.compile(r"/contest/\d+/problem/\w+")
         )
         if child.name in ("p", "h1", "h2", "h3", "h4", "h5", "h6") and problem_link:
-            # 保存上一个 section
             if current_code:
                 for b in buf:
                     current_elements.append(b)
@@ -589,7 +659,6 @@ def split_body_by_problem(body_div) -> dict:
                 sections[current_code] = "".join(
                     str(el) for el in current_elements
                 )
-            # 开始新 section
             href = problem_link.get("href", "")
             m = re.search(r"/contest/(\d+)/problem/(\w+)", href)
             current_code = m.group(1) + m.group(2) if m else None
@@ -601,10 +670,8 @@ def split_body_by_problem(body_div) -> dict:
         if current_code is not None:
             current_elements.append(child)
         elif buf:
-            # 尚未遇到任何题目标题的内容，保留在 buf 中
             pass
 
-    # 最后一个 section
     if current_code and current_elements:
         sections[current_code] = "".join(
             str(el) for el in current_elements
